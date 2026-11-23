@@ -2,12 +2,15 @@ package abi_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/soroworks/soroprobe/internal/abi"
+	"github.com/soroworks/soroprobe/internal/abi/abitest"
 	"github.com/soroworks/soroprobe/internal/stellar/stellartest"
 )
 
@@ -34,4 +37,149 @@ func TestChainSourceReportsNoWasmForSAC(t *testing.T) {
 	source := abi.NewChainSource(stellartest.NewFake(t))
 	_, err := source.Interface(context.Background(), "testnet", stellartest.SACContract)
 	assert.ErrorIs(t, err, abi.ErrNoWasm)
+}
+
+func TestChainSourceCodeReturnsTheLiveWasmAndItsHash(t *testing.T) {
+	t.Parallel()
+
+	fake := stellartest.NewFake(t)
+	wasm := abitest.Wasm(t, abitest.Fn("get", nil))
+	hash := fake.DeployWasm(t, stellartest.UndeployedContract, wasm)
+
+	got, gotHash, err := abi.NewChainSource(fake).Code(context.Background(), stellartest.UndeployedContract)
+	require.NoError(t, err)
+	assert.Equal(t, wasm, got)
+	assert.Equal(t, hash, gotHash)
+	assert.Equal(t, fmt.Sprintf("%x", sha256.Sum256(wasm)), gotHash)
+}
+
+func TestChainSourceCodeErrors(t *testing.T) {
+	t.Parallel()
+
+	source := abi.NewChainSource(stellartest.NewFake(t))
+
+	_, _, err := source.Code(context.Background(), stellartest.SACContract)
+	assert.ErrorIs(t, err, abi.ErrNoWasm)
+
+	_, _, err = source.Code(context.Background(), stellartest.UndeployedContract)
+	assert.ErrorIs(t, err, abi.ErrUnknownContract)
+
+	_, _, err = source.Code(context.Background(), "not-a-contract")
+	require.Error(t, err)
+}
+
+func TestParseWasmEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		wasm    []byte
+		wantErr string
+	}{
+		{
+			name:    "empty input",
+			wasm:    nil,
+			wantErr: "invalid Wasm module",
+		},
+		{
+			name:    "module without custom sections",
+			wasm:    []byte{0x00, 'a', 's', 'm', 0x01, 0x00, 0x00, 0x00},
+			wantErr: "no such custom section",
+		},
+		{
+			name: "section length exceeds module",
+			wasm: []byte{
+				0x00, 'a', 's', 'm', 0x01, 0x00, 0x00, 0x00,
+				0x00, 0x02, 'x',
+			},
+			wantErr: "invalid Wasm section length",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			iface, err := abi.ParseWasm(tt.wasm)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				assert.Nil(t, iface)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Empty(t, iface.Functions)
+			assert.Empty(t, iface.Types)
+		})
+	}
+}
+
+func TestParseMeta(t *testing.T) {
+	t.Parallel()
+
+	wasm := abitest.WasmWithMeta(t, nil, []abitest.Meta{
+		{Key: "rsver", Val: "1.91.0"},
+		{Key: "source_repo", Val: "https://github.com/example/token"},
+		{Key: "commit_hash", Val: "abc123"},
+		{Key: "bldimg", Val: "example/build@sha256:00"},
+		{Key: "commit_hash", Val: "def456"},
+	})
+	meta, err := abi.ParseMeta(wasm)
+	require.NoError(t, err)
+	assert.Equal(t, "https://github.com/example/token", meta["source_repo"])
+	assert.Equal(t, "example/build@sha256:00", meta["bldimg"])
+	assert.Equal(t, "def456", meta["commit_hash"], "a repeated key keeps its last value")
+}
+
+func TestParseMetaWithoutASectionIsEmptyNotAnError(t *testing.T) {
+	t.Parallel()
+
+	meta, err := abi.ParseMeta(abitest.Wasm(t, abitest.Fn("get", nil)))
+	require.NoError(t, err)
+	assert.Empty(t, meta)
+}
+
+func TestParseMetaEdgeCases(t *testing.T) {
+	t.Parallel()
+
+	truncatedMetaWasm := append(
+		[]byte{0x00, 'a', 's', 'm', 0x01, 0x00, 0x00, 0x00, 0x00, 19, 14},
+		[]byte("contractmetav0")...,
+	)
+	truncatedMetaWasm = append(truncatedMetaWasm, []byte{0, 0, 0, 0}...)
+
+	tests := []struct {
+		name    string
+		wasm    []byte
+		want    map[string]string
+		wantErr string
+	}{
+		{
+			name:    "empty input",
+			wasm:    nil,
+			wantErr: "invalid Wasm module",
+		},
+		{
+			name: "empty key and value",
+			wasm: abitest.WasmWithMeta(t, nil, []abitest.Meta{{Key: "", Val: ""}}),
+			want: map[string]string{"": ""},
+		},
+		{
+			name:    "truncated metadata entry",
+			wasm:    truncatedMetaWasm,
+			wantErr: "decode contract metadata",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			meta, err := abi.ParseMeta(tt.wasm)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, meta)
+		})
+	}
 }
